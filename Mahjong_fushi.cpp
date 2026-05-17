@@ -15,15 +15,18 @@
 
 #if defined(ENABLE_MAHJONGGB) && ENABLE_MAHJONGGB
 #if defined(__has_include)
-#if __has_include("MahjongGB/MahjongGB.h")
+#if __has_include("ChineseOfficialMahjongHelper/Classes/mahjong-algorithm/fan_calculator.cpp") && \
+    __has_include("ChineseOfficialMahjongHelper/Classes/mahjong-algorithm/shanten.cpp") && \
+    __has_include("ChineseOfficialMahjongHelper/Classes/mahjong-algorithm/fan_calculator.h")
 #define HAVE_MAHJONGGB 1
-#include "MahjongGB/MahjongGB.h"
+#include "ChineseOfficialMahjongHelper/Classes/mahjong-algorithm/fan_calculator.cpp"
+#include "ChineseOfficialMahjongHelper/Classes/mahjong-algorithm/shanten.cpp"
+#include "ChineseOfficialMahjongHelper/Classes/mahjong-algorithm/fan_calculator.h"
 #else
 #define HAVE_MAHJONGGB 0
 #endif
 #else
-#define HAVE_MAHJONGGB 1
-#include "MahjongGB/MahjongGB.h"
+#define HAVE_MAHJONGGB 0
 #endif
 #else
 #define HAVE_MAHJONGGB 0
@@ -699,6 +702,7 @@ namespace
     int ChiOfferIndex(int claimedTile, int middleTile);
     void MarkDrawContext(GameState& state, int who);
     void MarkKongFollowup(GameState& state, int who);
+    void SetSimulatedSelfDrawTile(GameState& state, int tileId);
 
     int TotalCount(const array<int, TILE_KIND_COUNT>& counts)
     {
@@ -1019,6 +1023,10 @@ namespace
             return false;
         }
         me.melds[pengIndex].type = ActionType::Gang;
+        if (1 <= me.melds[pengIndex].offer && me.melds[pengIndex].offer <= 3)
+        {
+            me.melds[pengIndex].offer += 4;
+        }
         if (!AddFixedTile(me, tileId, 1))
         {
             return false;
@@ -1159,6 +1167,10 @@ namespace
             return false;
         }
         player.melds[pengIndex].type = ActionType::Gang;
+        if (1 <= player.melds[pengIndex].offer && player.melds[pengIndex].offer <= 3)
+        {
+            player.melds[pengIndex].offer += 4;
+        }
         if (!AddFixedTile(player, tileId, 1))
         {
             return false;
@@ -2800,6 +2812,30 @@ namespace
 
     bool CanHuConservatively(const GameState& state, int winTile, bool selfDraw)
     {
+        static unordered_map<string, bool> cache;
+        bool ok = false;
+        string key;
+        if (state.myID >= 0)
+        {
+            key.reserve(64);
+            for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+            {
+                key.push_back(static_cast<char>('0' + state.players[state.myID].liveCount[tile]));
+            }
+            key.push_back('|');
+            key += to_string(winTile);
+            key.push_back('|');
+            key.push_back(selfDraw ? '1' : '0');
+            key.push_back('|');
+            key.push_back(static_cast<char>('0' + (state.currentDrawAboutKong[state.myID] ? 1 : 0)));
+            key.push_back('|');
+            key += to_string(state.wallRemain[state.myID]);
+            const auto it = cache.find(key);
+            if (it != cache.end())
+            {
+                return it->second;
+            }
+        }
 #if HAVE_MAHJONGGB
         int actualWinTile = winTile;
         if (selfDraw)
@@ -2811,12 +2847,19 @@ namespace
             actualWinTile = state.currentDrawTile[state.myID];
         }
         const int fan = CalculateFanWithMahjongGB(state, actualWinTile, selfDraw);
-        if (fan >= 0)
+        ok = fan >= 8;
+        if (!key.empty())
         {
-            return fan >= 8;
+            cache.emplace(std::move(key), ok);
         }
+        return ok;
 #endif
-        return EstimateGuaranteedFan(state, winTile, selfDraw) >= 8;
+        ok = EstimateGuaranteedFan(state, winTile, selfDraw) >= 8;
+        if (!key.empty())
+        {
+            cache.emplace(std::move(key), ok);
+        }
+        return ok;
     }
 
     bool ClaimsLockedByEmptyWall(const GameState& state, int discarder)
@@ -3005,6 +3048,10 @@ namespace
         const int likelyReadyOpponents = CountLikelyReadyOpponents(state);
         int bonus = 480 + 80 * exact.winKinds + min(320, 12 * exact.winTiles);
         bonus += 20 * min(2, exact.flexibleWinKinds);
+        if (exact.winKinds == 1)
+        {
+            bonus -= 160;
+        }
 
         if (CountFixedMelds(me) >= 1)
         {
@@ -3033,6 +3080,10 @@ namespace
         if (exact.winKinds == 1 && exact.winTiles <= 2)
         {
             bonus -= 420;
+        }
+        if (roundProgress <= 10)
+        {
+            bonus = bonus * 4 / 5;
         }
         return bonus;
     }
@@ -3717,6 +3768,7 @@ namespace
                 {
                     continue;
                 }
+                SetSimulatedSelfDrawTile(next, tile);
                 if (CanHuConservatively(next, -1, true))
                 {
                     pattern.improve[tile] = 1;
@@ -3804,6 +3856,7 @@ namespace
             {
                 continue;
             }
+            SetSimulatedSelfDrawTile(afterDraw, drawTile);
 
             ExactHandInfo bestFollow;
             for (int discardTile = 0; discardTile < TILE_KIND_COUNT; ++discardTile)
@@ -3889,6 +3942,7 @@ namespace
             {
                 continue;
             }
+            SetSimulatedSelfDrawTile(afterDraw, drawTile);
 
             ShapeWaitInfo bestFollow;
             for (int discardTile = 0; discardTile < TILE_KIND_COUNT; ++discardTile)
@@ -7195,6 +7249,7 @@ namespace
             {
                 continue;
             }
+            SetSimulatedSelfDrawTile(next, tile);
 
             const int futureScore = EvaluateDrawnState(next);
             weightedScore += 1LL * remain * futureScore;
@@ -7719,6 +7774,14 @@ namespace
                 {
                     risk += 4;
                 }
+                if (threat.flushConfidence >= 12)
+                {
+                    risk += 6;
+                }
+                if (threat.flushConfidence >= 18)
+                {
+                    risk += 8;
+                }
             }
             else if (threat.twoSuitPressure)
             {
@@ -7883,6 +7946,7 @@ namespace
             return 0;
         }
 
+        const PlayerState& me = state.players[state.myID];
         const int roundProgress = EstimateRoundProgress(state);
         const int likelyReadyOpponents = CountLikelyReadyOpponents(state);
         int risk = 36;
@@ -7902,6 +7966,14 @@ namespace
         {
             risk += 4;
         }
+        else if (roundProgress >= 9 && roundProgress <= 13)
+        {
+            const int rank = RankOf(tileId);
+            if (rank >= 4 && rank <= 6)
+            {
+                risk += 8;
+            }
+        }
 
         for (int who = 0; who < PLAYER_COUNT; ++who)
         {
@@ -7912,6 +7984,14 @@ namespace
             const OpponentThreatInfo threat = EvaluateOpponentThreat(state, who);
             risk += threat.pressure / 6;
             risk += EvaluateTileRiskAgainstOpponent(state, tileId, who, threat);
+        }
+        if (!IsHonorTile(tileId) && me.melds.size() >= 1 && roundProgress >= 8)
+        {
+            const int rank = RankOf(tileId);
+            if (rank >= 2 && rank <= 8)
+            {
+                risk += 4;
+            }
         }
         risk -= min(10, 4 - state.poolRemain[tileId]) * 2;
         return max(0, risk);
@@ -9065,111 +9145,167 @@ namespace
         state.nextDrawAboutKong[who] = true;
     }
 
-#if HAVE_MAHJONGGB
-    string TileIdToMahjongGBStr(int tileId)
+    void SetSimulatedSelfDrawTile(GameState& state, int tileId)
     {
-        return TileIdToStr(tileId);
+        if (state.myID < 0 || state.myID >= PLAYER_COUNT || !IsValidTile(tileId))
+        {
+            return;
+        }
+        state.currentDrawTile[state.myID] = tileId;
     }
 
-    using MahjongGBPack = pair<string, pair<string, int> >;
-
-    vector<MahjongGBPack> BuildMahjongGBPacks(const GameState& state)
+#if HAVE_MAHJONGGB
+    mahjong::tile_t TileIdToMahjongGBTile(int tileId)
     {
-        vector<MahjongGBPack> packs;
+        if (!IsValidTile(tileId))
+        {
+            return 0;
+        }
+        if (tileId < 9)
+        {
+            return mahjong::make_tile(TILE_SUIT_DOTS, RankOf(tileId));
+        }
+        if (tileId < 18)
+        {
+            return mahjong::make_tile(TILE_SUIT_BAMBOO, RankOf(tileId));
+        }
+        if (tileId < 27)
+        {
+            return mahjong::make_tile(TILE_SUIT_CHARACTERS, RankOf(tileId));
+        }
+        if (tileId <= 30)
+        {
+            return mahjong::make_tile(TILE_SUIT_HONORS, tileId - 27 + 1);
+        }
+        return mahjong::make_tile(TILE_SUIT_HONORS, tileId - 31 + 5);
+    }
+
+    int CalculateFanWithMahjongGB(const GameState& state, int winTile, bool selfDraw)
+    {
+        static unordered_map<string, int> cache;
         if (state.myID < 0)
         {
-            return packs;
+            return -1;
+        }
+
+        int actualWinTile = winTile;
+        if (selfDraw)
+        {
+            actualWinTile = IsValidTile(winTile) ? winTile : state.currentDrawTile[state.myID];
+        }
+        if (!IsValidTile(actualWinTile))
+        {
+            return -1;
+        }
+
+        string key;
+        key.reserve(96);
+        key += EncodeLiveKey(state.players[state.myID].liveCount);
+        key.push_back('|');
+        key += to_string(actualWinTile);
+        key.push_back('|');
+        key.push_back(selfDraw ? '1' : '0');
+        key.push_back('|');
+        key += to_string(state.currentDrawAboutKong[state.myID] ? 1 : 0);
+        key.push_back('|');
+        key += to_string(state.wallRemain[state.myID]);
+        key.push_back('|');
+        key += to_string(state.quan);
+        key.push_back('|');
+        key += to_string(state.myID);
+        const auto cached = cache.find(key);
+        if (cached != cache.end())
+        {
+            return cached->second;
         }
 
         const PlayerState& me = state.players[state.myID];
-        packs.reserve(me.melds.size());
-        for (const Meld& meld : me.melds)
-        {
-            if (meld.type == ActionType::Chi)
-            {
-                packs.push_back({"CHI", {TileIdToMahjongGBStr(meld.tile - 1), meld.offer}});
-            }
-            else if (meld.type == ActionType::Peng)
-            {
-                packs.push_back({"PENG", {TileIdToMahjongGBStr(meld.tile), meld.offer}});
-            }
-            else if (meld.type == ActionType::Gang)
-            {
-                packs.push_back({"GANG", {TileIdToMahjongGBStr(meld.tile), meld.offer}});
-            }
-        }
-        return packs;
-    }
+        mahjong::calculate_param_t calculateParam;
+        mahjong::fan_table_t fanTable;
+        memset(&calculateParam, 0, sizeof(calculateParam));
+        memset(&fanTable, 0, sizeof(fanTable));
 
-    vector<string> BuildMahjongGBHandTiles(const PlayerState& me, int winTile, bool selfDraw)
-    {
-        vector<string> hand;
+        int standingCount = 0;
         for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
         {
             int count = me.liveCount[tile];
-            if (!selfDraw && tile == winTile)
+            if (!selfDraw && tile == actualWinTile)
             {
                 --count;
             }
             for (int i = 0; i < count; ++i)
             {
-                hand.push_back(TileIdToMahjongGBStr(tile));
+                if (standingCount >= 13)
+                {
+                    return -1;
+                }
+                calculateParam.hand_tiles.standing_tiles[standingCount++] = TileIdToMahjongGBTile(tile);
             }
         }
-        sort(hand.begin(), hand.end());
-        return hand;
-    }
+        sort(calculateParam.hand_tiles.standing_tiles,
+             calculateParam.hand_tiles.standing_tiles + standingCount);
+        calculateParam.hand_tiles.tile_count = standingCount;
 
-    int CalculateFanWithMahjongGB(const GameState& state, int winTile, bool selfDraw)
-    {
-        if (state.myID < 0 || !IsValidTile(winTile))
+        int packCount = 0;
+        for (const Meld& meld : me.melds)
         {
-            return -1;
+            if (packCount >= 5)
+            {
+                return -1;
+            }
+            if (meld.type == ActionType::Chi)
+            {
+                calculateParam.hand_tiles.fixed_packs[packCount++] =
+                    mahjong::make_pack(meld.offer, PACK_TYPE_CHOW, TileIdToMahjongGBTile(meld.tile - 1));
+            }
+            else if (meld.type == ActionType::Peng)
+            {
+                calculateParam.hand_tiles.fixed_packs[packCount++] =
+                    mahjong::make_pack(meld.offer, PACK_TYPE_PUNG, TileIdToMahjongGBTile(meld.tile));
+            }
+            else if (meld.type == ActionType::Gang)
+            {
+                calculateParam.hand_tiles.fixed_packs[packCount++] =
+                    mahjong::make_pack(meld.offer, PACK_TYPE_KONG, TileIdToMahjongGBTile(meld.tile));
+            }
         }
+        calculateParam.hand_tiles.pack_count = packCount;
 
-        const PlayerState& me = state.players[state.myID];
-        const auto packs = BuildMahjongGBPacks(state);
-        const auto hand = BuildMahjongGBHandTiles(me, winTile, selfDraw);
-        if (hand.size() % 3 != 1)
-        {
-            return -1;
-        }
-
-        const bool is4thTile = state.poolRemain[winTile] == 0;
+        const bool is4thTile = state.poolRemain[actualWinTile] == 0;
         const bool isAboutKong = state.currentDrawAboutKong[state.myID];
         const bool isWallLast = state.wallRemain[state.myID] == 0;
-        const int flowerCount = me.flowerCount;
-
-        int totalFan = 0;
-        try
+        calculateParam.win_tile = TileIdToMahjongGBTile(actualWinTile);
+        calculateParam.flower_count = me.flowerCount;
+        calculateParam.win_flag = selfDraw ? WIN_FLAG_SELF_DRAWN : WIN_FLAG_DISCARD;
+        if (is4thTile)
         {
-            static bool initialized = false;
-            if (!initialized)
-            {
-                MahjongInit();
-                initialized = true;
-            }
-            const auto result = MahjongFanCalculator(
-                packs,
-                hand,
-                TileIdToMahjongGBStr(winTile),
-                flowerCount,
-                selfDraw,
-                is4thTile,
-                isAboutKong,
-                isWallLast,
-                state.myID,
-                state.quan);
-            for (const auto& item : result)
-            {
-                totalFan += item.first;
-            }
-            return totalFan;
+            calculateParam.win_flag |= WIN_FLAG_4TH_TILE;
         }
-        catch (...)
+        if (isAboutKong)
         {
+            calculateParam.win_flag |= WIN_FLAG_ABOUT_KONG;
+        }
+        if (isWallLast)
+        {
+            calculateParam.win_flag |= WIN_FLAG_WALL_LAST;
+        }
+        calculateParam.prevalent_wind = static_cast<mahjong::wind_t>(state.quan);
+        calculateParam.seat_wind = static_cast<mahjong::wind_t>(state.myID);
+
+        const int result = mahjong::calculate_fan(&calculateParam, &fanTable);
+        if (result < 0)
+        {
+            cache.emplace(std::move(key), -1);
             return -1;
         }
+
+        int totalFan = 0;
+        for (int i = 0; i < mahjong::FAN_TABLE_SIZE; ++i)
+        {
+            totalFan += fanTable[i] * mahjong::fan_value_table[i];
+        }
+        cache.emplace(std::move(key), totalFan);
+        return totalFan;
     }
 #endif
 }
