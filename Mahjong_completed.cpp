@@ -6,6 +6,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace std;
@@ -17,6 +18,8 @@ namespace
     constexpr int RANK_COUNT = 9;
     constexpr int TILE_KIND_COUNT = SUIT_COUNT * RANK_COUNT;
     constexpr int INF = numeric_limits<int>::max() / 4;
+    constexpr bool kEmitDecisionDiagnostics = true;
+    constexpr size_t kMaxDiagnosticActions = 6;
 
     struct MatchInput
     {
@@ -110,14 +113,14 @@ namespace
                 }
                 else if (key == "responses")
                 {
-                    if (!ParseStringArray(input.responses))
+                    if (!ParseNullableStringArray(input.responses))
                     {
                         return false;
                     }
                 }
                 else if (key == "data")
                 {
-                    if (!ParseString(input.data))
+                    if (!ParseNullableString(input.data))
                     {
                         return false;
                     }
@@ -242,6 +245,50 @@ namespace
 
                 string item;
                 if (!ParseString(item))
+                {
+                    return false;
+                }
+                out.push_back(item);
+            }
+        }
+
+        bool ParseNullableString(string& out)
+        {
+            SkipWhitespace();
+            if (StartsWith("null"))
+            {
+                pos_ += 4;
+                out.clear();
+                return true;
+            }
+            return ParseString(out);
+        }
+
+        bool ParseNullableStringArray(vector<string>& out)
+        {
+            out.clear();
+            SkipWhitespace();
+            if (!Consume('['))
+            {
+                return false;
+            }
+
+            bool first = true;
+            while (true)
+            {
+                SkipWhitespace();
+                if (Consume(']'))
+                {
+                    return true;
+                }
+                if (!first && !Consume(','))
+                {
+                    return false;
+                }
+                first = false;
+
+                string item;
+                if (!ParseNullableString(item))
                 {
                     return false;
                 }
@@ -458,6 +505,8 @@ struct PlayerState
 {
     array<int, TILE_KIND_COUNT> liveCount{};
     array<int, TILE_KIND_COUNT> fixedCount{};
+    array<int, TILE_KIND_COUNT> discardTileCount{};
+    array<int, SUIT_COUNT> discardSuitCount{};
     vector<Meld> melds;
     vector<int> discards;
     bool hasHu = false;
@@ -524,7 +573,7 @@ int EvaluateDiscard(const GameState& state, int tileId);
 Action ChooseBestAction(const GameState& state, const vector<Action>& legalActions);
 string BuildBestTargetHand(const GameState& state);
 
-Action DecideAction(const GameState& state, const ParsedRequest& currentReq);
+Action DecideAction(const GameState& state, const ParsedRequest& currentReq, string* diagnostics = nullptr);
 string FormatAction(const Action& action);
 
 namespace
@@ -598,6 +647,18 @@ namespace
         return true;
     }
 
+    bool RecordDiscard(PlayerState& player, int tileId)
+    {
+        if (!IsValidTile(tileId))
+        {
+            return false;
+        }
+        player.discards.push_back(tileId);
+        ++player.discardTileCount[tileId];
+        ++player.discardSuitCount[SuitOf(tileId)];
+        return true;
+    }
+
     bool ApplySelfDiscard(GameState& state, int tileId, bool setPending)
     {
         PlayerState& me = state.players[state.myID];
@@ -605,7 +666,11 @@ namespace
         {
             return false;
         }
-        me.discards.push_back(tileId);
+        if (!RecordDiscard(me, tileId))
+        {
+            AddLiveTile(me, tileId);
+            return false;
+        }
         if (setPending)
         {
             SetPendingDiscard(state, state.myID, tileId);
@@ -1031,6 +1096,96 @@ namespace
         return score;
     }
 
+    int CountWeakSuitFragmentPenalty(const array<int, TILE_KIND_COUNT>& liveCount)
+    {
+        int score = 0;
+        array<int, SUIT_COUNT> suitTotals{};
+        for (int suit = 0; suit < SUIT_COUNT; ++suit)
+        {
+            const int base = suit * RANK_COUNT;
+            for (int rank = 0; rank < RANK_COUNT; ++rank)
+            {
+                suitTotals[suit] += liveCount[base + rank];
+            }
+        }
+
+        for (int suit = 0; suit < SUIT_COUNT; ++suit)
+        {
+            const int total = suitTotals[suit];
+            if (total == 0)
+            {
+                continue;
+            }
+
+            const int base = suit * RANK_COUNT;
+            vector<int> ranks;
+            bool hasPair = false;
+            for (int rank = 0; rank < RANK_COUNT; ++rank)
+            {
+                if (liveCount[base + rank] > 0)
+                {
+                    ranks.push_back(rank);
+                }
+                if (liveCount[base + rank] >= 2)
+                {
+                    hasPair = true;
+                }
+            }
+
+            int localPenalty = 0;
+            if (total == 1)
+            {
+                localPenalty += 26;
+            }
+            else if (total == 2)
+            {
+                if (hasPair)
+                {
+                    localPenalty -= 10;
+                }
+                else if (static_cast<int>(ranks.size()) == 2)
+                {
+                    const int gap = ranks[1] - ranks[0];
+                    if (gap >= 3)
+                    {
+                        localPenalty += 24;
+                    }
+                    else if (gap == 2)
+                    {
+                        localPenalty += 8;
+                    }
+                }
+            }
+            else if (total == 3 && static_cast<int>(ranks.size()) >= 2)
+            {
+                const int span = ranks.back() - ranks.front();
+                if (hasPair && span >= 4)
+                {
+                    localPenalty += 14;
+                }
+                else if (!hasPair && span >= 6)
+                {
+                    localPenalty += 18;
+                }
+            }
+
+            int strongOtherSuits = 0;
+            for (int other = 0; other < SUIT_COUNT; ++other)
+            {
+                if (other != suit && suitTotals[other] >= 4)
+                {
+                    ++strongOtherSuits;
+                }
+            }
+            if (localPenalty > 0 && total <= 2 && strongOtherSuits >= 1)
+            {
+                localPenalty += 8;
+            }
+            score -= localPenalty;
+        }
+        return score;
+    }
+
     vector<int> BuildTargetTiles(const GameState& state, const TargetPlan& plan)
     {
         vector<int> tiles;
@@ -1349,7 +1504,10 @@ bool ApplyRequestEvent(GameState& state, const ParsedRequest& req)
             {
                 return false;
             }
-            state.players[req.who].discards.push_back(req.tile);
+            if (!RecordDiscard(state.players[req.who], req.tile))
+            {
+                return false;
+            }
             if (!ConsumePoolVisibility(state, req.tile))
             {
                 return false;
@@ -1863,33 +2021,1299 @@ vector<Action> GenerateLegalActions(const GameState& state, const ParsedRequest&
     return actions;
 }
 
+namespace
+{
+    int CountIsolationPenalty(const GameState& state, const array<int, TILE_KIND_COUNT>& liveCount)
+    {
+        int score = 0;
+        for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+        {
+            if (liveCount[tile] != 1)
+            {
+                continue;
+            }
+
+            const int suit = SuitOf(tile);
+            const int rank = RankOf(tile) - 1;
+            int nearby = 0;
+            for (int delta = -2; delta <= 2; ++delta)
+            {
+                if (delta == 0)
+                {
+                    continue;
+                }
+                const int nextRank = rank + delta;
+                if (nextRank < 0 || nextRank >= RANK_COUNT)
+                {
+                    continue;
+                }
+                nearby += min(1, liveCount[suit * RANK_COUNT + nextRank]);
+            }
+
+            if (nearby == 0)
+            {
+                score -= 18;
+                if (rank == 0 || rank == RANK_COUNT - 1)
+                {
+                    score -= 10;
+                }
+                if (state.poolRemain[tile] <= 1)
+                {
+                    score -= 6;
+                }
+            }
+        }
+        return score;
+    }
+
+    int EvaluateDiscardUrgency(const GameState& state, int tileId)
+    {
+        if (state.myID < 0 || !IsValidTile(tileId))
+        {
+            return 0;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        const int count = me.liveCount[tileId];
+        if (count <= 0)
+        {
+            return 0;
+        }
+
+        const int suit = SuitOf(tileId);
+        const int rank = RankOf(tileId) - 1;
+        int nearby = 0;
+        bool edgeConnected = false;
+        for (int delta = -2; delta <= 2; ++delta)
+        {
+            if (delta == 0)
+            {
+                continue;
+            }
+            const int nextRank = rank + delta;
+            if (nextRank < 0 || nextRank >= RANK_COUNT)
+            {
+                continue;
+            }
+            const int nextTile = suit * RANK_COUNT + nextRank;
+            nearby += me.liveCount[nextTile];
+            if (abs(delta) == 1 && me.liveCount[nextTile] > 0)
+            {
+                edgeConnected = true;
+            }
+        }
+
+        int urgency = 3 * (4 - max(0, state.poolRemain[tileId]));
+        if (count == 1)
+        {
+            urgency += 8;
+        }
+        if (count >= 2)
+        {
+            urgency -= 18;
+        }
+        if (nearby == 0)
+        {
+            urgency += 18;
+        }
+        else
+        {
+            urgency -= 4 * min(nearby, 3);
+        }
+        if ((rank == 0 || rank == RANK_COUNT - 1) && count == 1)
+        {
+            urgency += 8;
+        }
+        if (!edgeConnected && count == 1 && state.poolRemain[tileId] <= 1)
+        {
+            urgency += 6;
+        }
+        return urgency;
+    }
+
+    struct PlanMetrics
+    {
+        bool valid = false;
+        int distance = INF;
+        int support = numeric_limits<int>::min() / 4;
+    };
+
+    struct ExactHandInfo
+    {
+        int shanten = INF;
+        int improveTiles = 0;
+        int improveKinds = 0;
+        int winTiles = 0;
+        int winKinds = 0;
+        int flexibleWinKinds = 0;
+        int futureWinTiles = 0;
+        int futureWinKinds = 0;
+        int futureFlexibleWinKinds = 0;
+    };
+
+    struct ExactHandPattern
+    {
+        int shanten = INF;
+        array<unsigned char, TILE_KIND_COUNT> improve{};
+        array<unsigned char, TILE_KIND_COUNT> win{};
+    };
+
+    struct DrawDecisionSummary
+    {
+        int score = -INF;
+        PlanMetrics standbyPlan{};
+        ExactHandInfo exact{};
+    };
+
+    struct StaticHandEvaluation
+    {
+        int score = -INF;
+        PlanMetrics plan{};
+        ExactHandInfo exact{};
+    };
+
+    struct StandbyInfo
+    {
+        bool standby = false;
+        int winningTiles = 0;
+        int winningKinds = 0;
+        int flexibleWinningKinds = 0;
+    };
+
+    bool IsBetterPlanMetrics(const PlanMetrics& lhs, const PlanMetrics& rhs)
+    {
+        if (!lhs.valid)
+        {
+            return false;
+        }
+        if (!rhs.valid)
+        {
+            return true;
+        }
+        return lhs.distance < rhs.distance || (lhs.distance == rhs.distance && lhs.support > rhs.support);
+    }
+
+    bool IsStandbyState(const GameState& state)
+    {
+        if (state.myID < 0)
+        {
+            return false;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        const int needMelds = 4 - CountFixedMelds(me);
+        if (needMelds < 0)
+        {
+            return false;
+        }
+        return TotalLiveCount(me) == 3 * needMelds + 1;
+    }
+
+    bool IsBetterExactHandInfo(const ExactHandInfo& lhs, const ExactHandInfo& rhs)
+    {
+        if (lhs.shanten != rhs.shanten)
+        {
+            return lhs.shanten < rhs.shanten;
+        }
+        if (lhs.shanten == 0)
+        {
+            if (lhs.winKinds != rhs.winKinds)
+            {
+                return lhs.winKinds > rhs.winKinds;
+            }
+            if (lhs.winTiles != rhs.winTiles)
+            {
+                return lhs.winTiles > rhs.winTiles;
+            }
+            if (lhs.flexibleWinKinds != rhs.flexibleWinKinds)
+            {
+                return lhs.flexibleWinKinds > rhs.flexibleWinKinds;
+            }
+        }
+        if (lhs.shanten == 1)
+        {
+            if (lhs.futureWinKinds != rhs.futureWinKinds)
+            {
+                return lhs.futureWinKinds > rhs.futureWinKinds;
+            }
+            if (lhs.futureWinTiles != rhs.futureWinTiles)
+            {
+                return lhs.futureWinTiles > rhs.futureWinTiles;
+            }
+            if (lhs.futureFlexibleWinKinds != rhs.futureFlexibleWinKinds)
+            {
+                return lhs.futureFlexibleWinKinds > rhs.futureFlexibleWinKinds;
+            }
+        }
+        if (lhs.improveTiles != rhs.improveTiles)
+        {
+            return lhs.improveTiles > rhs.improveTiles;
+        }
+        if (lhs.improveKinds != rhs.improveKinds)
+        {
+            return lhs.improveKinds > rhs.improveKinds;
+        }
+        return lhs.winTiles > rhs.winTiles;
+    }
+
+    int EncodeSuitKey(const array<int, RANK_COUNT>& counts)
+    {
+        int key = 0;
+        int base = 1;
+        for (int count : counts)
+        {
+            key += count * base;
+            base *= 5;
+        }
+        return key;
+    }
+
+    unsigned long long EncodeLiveKey(const array<int, TILE_KIND_COUNT>& counts)
+    {
+        unsigned long long key = 0;
+        unsigned long long base = 1;
+        for (int count : counts)
+        {
+            key += static_cast<unsigned long long>(count) * base;
+            base *= 5ULL;
+        }
+        return key;
+    }
+
+    struct SuitExactState
+    {
+        int melds = 0;
+        int taatsu = 0;
+        int pairs = 0;
+    };
+
+    void CollectSuitExactStates(
+        array<int, RANK_COUNT>& counts,
+        int start,
+        int melds,
+        int taatsu,
+        int pairs,
+        array<array<array<bool, 2>, 5>, 5>& seen)
+    {
+        while (start < RANK_COUNT && counts[start] == 0)
+        {
+            ++start;
+        }
+        if (start >= RANK_COUNT)
+        {
+            seen[min(melds, 4)][min(taatsu, 4)][min(pairs, 1)] = true;
+            return;
+        }
+
+        if (melds < 4)
+        {
+            if (counts[start] >= 3)
+            {
+                counts[start] -= 3;
+                CollectSuitExactStates(counts, start, melds + 1, taatsu, pairs, seen);
+                counts[start] += 3;
+            }
+            if (start <= 6 && counts[start + 1] > 0 && counts[start + 2] > 0)
+            {
+                --counts[start];
+                --counts[start + 1];
+                --counts[start + 2];
+                CollectSuitExactStates(counts, start, melds + 1, taatsu, pairs, seen);
+                ++counts[start];
+                ++counts[start + 1];
+                ++counts[start + 2];
+            }
+        }
+
+        if (pairs == 0 && counts[start] >= 2)
+        {
+            counts[start] -= 2;
+            CollectSuitExactStates(counts, start, melds, taatsu, 1, seen);
+            counts[start] += 2;
+        }
+
+        if (taatsu < 4)
+        {
+            if (counts[start] >= 2)
+            {
+                counts[start] -= 2;
+                CollectSuitExactStates(counts, start, melds, taatsu + 1, pairs, seen);
+                counts[start] += 2;
+            }
+            if (start <= 7 && counts[start + 1] > 0)
+            {
+                --counts[start];
+                --counts[start + 1];
+                CollectSuitExactStates(counts, start, melds, taatsu + 1, pairs, seen);
+                ++counts[start];
+                ++counts[start + 1];
+            }
+            if (start <= 6 && counts[start + 2] > 0)
+            {
+                --counts[start];
+                --counts[start + 2];
+                CollectSuitExactStates(counts, start, melds, taatsu + 1, pairs, seen);
+                ++counts[start];
+                ++counts[start + 2];
+            }
+        }
+
+        --counts[start];
+        CollectSuitExactStates(counts, start, melds, taatsu, pairs, seen);
+        ++counts[start];
+    }
+
+    const vector<SuitExactState>& GetSuitExactStates(const array<int, RANK_COUNT>& counts)
+    {
+        static unordered_map<int, vector<SuitExactState>> cache;
+
+        const int key = EncodeSuitKey(counts);
+        const auto it = cache.find(key);
+        if (it != cache.end())
+        {
+            return it->second;
+        }
+
+        array<int, RANK_COUNT> work = counts;
+        array<array<array<bool, 2>, 5>, 5> seen{};
+        CollectSuitExactStates(work, 0, 0, 0, 0, seen);
+
+        vector<SuitExactState> states;
+        for (int melds = 0; melds <= 4; ++melds)
+        {
+            for (int taatsu = 0; taatsu <= 4; ++taatsu)
+            {
+                for (int pairs = 0; pairs <= 1; ++pairs)
+                {
+                    if (seen[melds][taatsu][pairs])
+                    {
+                        states.push_back({melds, taatsu, pairs});
+                    }
+                }
+            }
+        }
+        return cache.emplace(key, std::move(states)).first->second;
+    }
+
+    int CalcExactShantenFromCounts(const array<int, TILE_KIND_COUNT>& liveCount, int fixedMelds)
+    {
+        if (fixedMelds < 0 || fixedMelds > 4)
+        {
+            return INF;
+        }
+
+        const array<int, RANK_COUNT> suit0 = ExtractSuitCounts(liveCount, 0);
+        const array<int, RANK_COUNT> suit1 = ExtractSuitCounts(liveCount, 1);
+        const array<int, RANK_COUNT> suit2 = ExtractSuitCounts(liveCount, 2);
+        const auto& s0 = GetSuitExactStates(suit0);
+        const auto& s1 = GetSuitExactStates(suit1);
+        const auto& s2 = GetSuitExactStates(suit2);
+
+        int best = INF;
+        for (const SuitExactState& p0 : s0)
+        {
+            for (const SuitExactState& p1 : s1)
+            {
+                for (const SuitExactState& p2 : s2)
+                {
+                    const int melds = fixedMelds + p0.melds + p1.melds + p2.melds;
+                    if (melds > 4)
+                    {
+                        continue;
+                    }
+
+                    const int totalPairs = p0.pairs + p1.pairs + p2.pairs;
+                    const int head = totalPairs > 0 ? 1 : 0;
+                    int taatsu = p0.taatsu + p1.taatsu + p2.taatsu + max(0, totalPairs - 1);
+                    taatsu = min(taatsu, 4 - melds);
+                    best = min(best, 8 - 2 * melds - taatsu - head);
+                }
+            }
+        }
+        return best;
+    }
+
+    int GetExactShanten(const GameState& state)
+    {
+        static array<unordered_map<unsigned long long, int>, 5> cache;
+
+        if (state.myID < 0)
+        {
+            return INF;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        const int fixedMelds = CountFixedMelds(me);
+        const unsigned long long key = EncodeLiveKey(me.liveCount);
+        const auto it = cache[fixedMelds].find(key);
+        if (it != cache[fixedMelds].end())
+        {
+            return it->second;
+        }
+
+        const int shanten = CalcExactShantenFromCounts(me.liveCount, fixedMelds);
+        cache[fixedMelds][key] = shanten;
+        return shanten;
+    }
+
+    int GetBestDiscardShantenAfterDraw(const GameState& state)
+    {
+        static array<unordered_map<unsigned long long, int>, 5> cache;
+
+        if (state.myID < 0)
+        {
+            return INF;
+        }
+        if (CanHu(state))
+        {
+            return -1;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        const int fixedMelds = CountFixedMelds(me);
+        const unsigned long long key = EncodeLiveKey(me.liveCount);
+        const auto it = cache[fixedMelds].find(key);
+        if (it != cache[fixedMelds].end())
+        {
+            return it->second;
+        }
+
+        int best = INF;
+        for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+        {
+            if (me.liveCount[tile] <= 0)
+            {
+                continue;
+            }
+
+            GameState next = state;
+            if (!ApplySelfDiscard(next, tile, false))
+            {
+                continue;
+            }
+            best = min(best, GetExactShanten(next));
+        }
+
+        cache[fixedMelds][key] = best;
+        return best;
+    }
+
+    const ExactHandPattern& GetExactHandPattern(const GameState& state)
+    {
+        static array<unordered_map<unsigned long long, ExactHandPattern>, 5> cache;
+        static const ExactHandPattern emptyPattern{};
+
+        if (state.myID < 0)
+        {
+            return emptyPattern;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        const int fixedMelds = CountFixedMelds(me);
+        const unsigned long long key = EncodeLiveKey(me.liveCount);
+        const auto it = cache[fixedMelds].find(key);
+        if (it != cache[fixedMelds].end())
+        {
+            return it->second;
+        }
+
+        ExactHandPattern pattern;
+        pattern.shanten = GetExactShanten(state);
+        if (IsStandbyState(state))
+        {
+            for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+            {
+                GameState next = state;
+                if (!AddLiveTile(next.players[next.myID], tile))
+                {
+                    continue;
+                }
+
+                if (CanHu(next))
+                {
+                    pattern.improve[tile] = 1;
+                    pattern.win[tile] = 1;
+                }
+                else if (GetBestDiscardShantenAfterDraw(next) < pattern.shanten)
+                {
+                    pattern.improve[tile] = 1;
+                }
+            }
+        }
+
+        return cache[fixedMelds].emplace(key, std::move(pattern)).first->second;
+    }
+
+    ExactHandInfo AnalyzeImmediateExactHandInfo(const GameState& state)
+    {
+        ExactHandInfo info;
+        if (state.myID < 0)
+        {
+            return info;
+        }
+
+        const ExactHandPattern& pattern = GetExactHandPattern(state);
+        info.shanten = pattern.shanten;
+        if (!IsStandbyState(state))
+        {
+            return info;
+        }
+
+        for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+        {
+            const int remain = state.poolRemain[tile];
+            if (remain <= 0 || !pattern.improve[tile])
+            {
+                continue;
+            }
+
+            info.improveTiles += remain;
+            ++info.improveKinds;
+            if (pattern.win[tile])
+            {
+                info.winTiles += remain;
+                ++info.winKinds;
+                const int rank = RankOf(tile);
+                if (2 <= rank && rank <= 8)
+                {
+                    ++info.flexibleWinKinds;
+                }
+            }
+        }
+        return info;
+    }
+
+    ExactHandInfo AnalyzeExactHandInfo(const GameState& state)
+    {
+        ExactHandInfo info = AnalyzeImmediateExactHandInfo(state);
+        if (state.myID < 0 || !IsStandbyState(state) || info.shanten != 1)
+        {
+            return info;
+        }
+
+        const ExactHandPattern& pattern = GetExactHandPattern(state);
+        for (int drawTile = 0; drawTile < TILE_KIND_COUNT; ++drawTile)
+        {
+            const int remain = state.poolRemain[drawTile];
+            if (remain <= 0 || !pattern.improve[drawTile] || pattern.win[drawTile])
+            {
+                continue;
+            }
+
+            GameState afterDraw = state;
+            if (!AddLiveTile(afterDraw.players[afterDraw.myID], drawTile))
+            {
+                continue;
+            }
+
+            ExactHandInfo bestFollow;
+            for (int discardTile = 0; discardTile < TILE_KIND_COUNT; ++discardTile)
+            {
+                if (afterDraw.players[afterDraw.myID].liveCount[discardTile] <= 0)
+                {
+                    continue;
+                }
+
+                GameState afterDiscard = afterDraw;
+                if (!ApplySelfDiscard(afterDiscard, discardTile, false))
+                {
+                    continue;
+                }
+
+                const ExactHandInfo follow = AnalyzeImmediateExactHandInfo(afterDiscard);
+                if (follow.shanten == 0 && IsBetterExactHandInfo(follow, bestFollow))
+                {
+                    bestFollow = follow;
+                }
+            }
+
+            if (bestFollow.shanten == 0)
+            {
+                info.futureWinTiles += remain * bestFollow.winTiles;
+                info.futureWinKinds += remain * bestFollow.winKinds;
+                info.futureFlexibleWinKinds += remain * bestFollow.flexibleWinKinds;
+            }
+        }
+
+        return info;
+    }
+
+    int CountDiscardsOfTile(const PlayerState& player, int tileId)
+    {
+        return IsValidTile(tileId) ? player.discardTileCount[tileId] : 0;
+    }
+
+    int CountDiscardsOfSuit(const PlayerState& player, int suit)
+    {
+        return 0 <= suit && suit < SUIT_COUNT ? player.discardSuitCount[suit] : 0;
+    }
+
+    int TotalDiscardCount(const GameState& state)
+    {
+        int total = 0;
+        for (const PlayerState& player : state.players)
+        {
+            total += static_cast<int>(player.discards.size());
+        }
+        return total;
+    }
+
+    int CountSequenceWaitPatterns(const GameState& state, int tileId)
+    {
+        if (!IsValidTile(tileId))
+        {
+            return 0;
+        }
+
+        const int suit = SuitOf(tileId);
+        const int rank = RankOf(tileId) - 1;
+        int patterns = 0;
+
+        const int startMin = max(0, rank - 2);
+        const int startMax = min(rank, RANK_COUNT - 3);
+        for (int start = startMin; start <= startMax; ++start)
+        {
+            bool ok = true;
+            for (int offset = 0; offset < 3; ++offset)
+            {
+                const int currentRank = start + offset;
+                if (currentRank == rank)
+                {
+                    continue;
+                }
+
+                const int needTile = suit * RANK_COUNT + currentRank;
+                if (state.poolRemain[needTile] <= 0)
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok)
+            {
+                ++patterns;
+            }
+        }
+        return patterns;
+    }
+
+    int CalcBaseTileDanger(const GameState& state, int tileId)
+    {
+        if (!IsValidTile(tileId))
+        {
+            return 0;
+        }
+
+        static const int rankDanger[RANK_COUNT] = {2, 5, 7, 9, 10, 9, 7, 5, 2};
+
+        int base = 6 + rankDanger[RankOf(tileId) - 1];
+        base += 7 * CountSequenceWaitPatterns(state, tileId);
+        base += 4 * min(2, max(0, state.poolRemain[tileId]));
+        if (state.poolRemain[tileId] <= 1)
+        {
+            base -= 4;
+        }
+        return max(0, base);
+    }
+
+    int CalcOpponentThreatWeight(const GameState& state, int who, int tileId)
+    {
+        if (who < 0 || who >= PLAYER_COUNT || who == state.myID || !IsValidTile(tileId))
+        {
+            return 0;
+        }
+
+        const PlayerState& player = state.players[who];
+        if (player.hasHu)
+        {
+            return 0;
+        }
+
+        int threat = 10 + 7 * CountFixedMelds(player);
+        threat += min(8, static_cast<int>(player.discards.size()) / 2);
+
+        if (CountFixedMelds(player) >= 2)
+        {
+            threat += 6;
+        }
+
+        const int sameSuitDiscards = CountDiscardsOfSuit(player, SuitOf(tileId));
+        if (sameSuitDiscards == 0)
+        {
+            threat += 5;
+        }
+        else if (sameSuitDiscards >= 5)
+        {
+            threat -= 4;
+        }
+
+        const int sameTileDiscards = CountDiscardsOfTile(player, tileId);
+        if (sameTileDiscards > 0)
+        {
+            threat -= 10 + 2 * (sameTileDiscards - 1);
+        }
+
+        return max(2, threat);
+    }
+
+    int EvaluateDiscardRisk(const GameState& state, int tileId)
+    {
+        if (state.myID < 0 || !IsValidTile(tileId))
+        {
+            return 0;
+        }
+
+        const int baseDanger = CalcBaseTileDanger(state, tileId);
+        if (baseDanger <= 0)
+        {
+            return 0;
+        }
+
+        int risk = 0;
+        int seenByOpponents = 0;
+        for (int who = 0; who < PLAYER_COUNT; ++who)
+        {
+            if (who == state.myID || state.players[who].hasHu)
+            {
+                continue;
+            }
+
+            if (CountDiscardsOfTile(state.players[who], tileId) > 0)
+            {
+                ++seenByOpponents;
+            }
+
+            const int threat = CalcOpponentThreatWeight(state, who, tileId);
+            risk += baseDanger * threat / 14;
+        }
+
+        if (seenByOpponents >= 2)
+        {
+            risk -= 12;
+        }
+
+        const int tableProgress = TotalDiscardCount(state);
+        const int phase = min(16, max(0, tableProgress - 8));
+        risk += risk * phase / 12;
+        return max(0, risk);
+    }
+
+    int AdjustRiskByAttackState(const GameState& state, int rawRisk)
+    {
+        if (rawRisk <= 0 || state.myID < 0)
+        {
+            return 0;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        int percent = 100;
+        percent -= 8 * CountFixedMelds(me);
+
+        const ExactHandInfo exact = AnalyzeExactHandInfo(state);
+        if (exact.shanten == 0)
+        {
+            if (exact.winTiles > 0)
+            {
+                percent -= min(55, 12 + 3 * exact.winTiles + 6 * exact.winKinds);
+            }
+            else
+            {
+                percent += 10;
+            }
+        }
+        else if (exact.shanten == 1)
+        {
+            percent -= min(28, 8 + exact.improveKinds + exact.improveTiles / 4);
+        }
+        else if (CountFixedMelds(me) >= 2)
+        {
+            percent -= 12;
+        }
+
+        percent = max(35, min(140, percent));
+        return rawRisk * percent / 100;
+    }
+
+    StaticHandEvaluation AnalyzeStaticHand(const GameState& state)
+    {
+        StaticHandEvaluation evaluation;
+        if (state.myID < 0)
+        {
+            return evaluation;
+        }
+
+        if (CanHu(state))
+        {
+            evaluation.score = 1000000;
+            return evaluation;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+        const ExactHandInfo exact = AnalyzeExactHandInfo(state);
+        evaluation.exact = exact;
+
+        int score = 6000;
+        if (exact.shanten < INF / 2)
+        {
+            score -= 1800 * exact.shanten;
+            if (exact.shanten == 0)
+            {
+                score += 1600;
+                score += 120 * exact.winTiles;
+                score += 280 * exact.winKinds;
+                score += 60 * exact.flexibleWinKinds;
+                if (exact.winKinds == 1)
+                {
+                    score -= 120;
+                }
+            }
+            else
+            {
+                score += 55 * exact.improveTiles;
+                score += 95 * exact.improveKinds;
+                if (exact.shanten == 1)
+                {
+                    score += 180;
+                    score += 12 * exact.futureWinTiles;
+                    score += 40 * exact.futureWinKinds;
+                    score += 10 * exact.futureFlexibleWinKinds;
+                }
+            }
+        }
+        score += 90 * CountFixedMelds(me);
+        score += CountPairTripletBonus(me.liveCount);
+        score += CountAdjacencyBonus(me.liveCount);
+        score += CountIsolationPenalty(state, me.liveCount);
+        score += CountWeakSuitFragmentPenalty(me.liveCount);
+        score += 3 * TotalLiveCount(me);
+        evaluation.score = score;
+        return evaluation;
+    }
+
+    int EvaluateStaticHandShape(const GameState& state)
+    {
+        return AnalyzeStaticHand(state).score;
+    }
+
+    DrawDecisionSummary EvaluateDrawnDecision(const GameState& state)
+    {
+        DrawDecisionSummary summary;
+        if (state.myID < 0)
+        {
+            return summary;
+        }
+        if (CanHu(state))
+        {
+            summary.score = 1000000;
+            summary.exact.shanten = -1;
+            return summary;
+        }
+
+        const PlayerState& me = state.players[state.myID];
+
+        for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+        {
+            if (!CanGangAfterDraw(state, tile))
+            {
+                continue;
+            }
+
+            GameState next = state;
+            if (!ApplySelfGangAfterDraw(next, tile))
+            {
+                continue;
+            }
+            const StaticHandEvaluation candidateEvaluation = AnalyzeStaticHand(next);
+            const int candidateScore = candidateEvaluation.score + 45;
+            if (candidateScore > summary.score ||
+                (candidateScore == summary.score && IsBetterExactHandInfo(candidateEvaluation.exact, summary.exact)))
+            {
+                summary.score = candidateScore;
+                summary.standbyPlan = PlanMetrics{};
+                summary.exact = candidateEvaluation.exact;
+            }
+        }
+
+        for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+        {
+            if (me.liveCount[tile] <= 0)
+            {
+                continue;
+            }
+
+            GameState next = state;
+            if (!ApplySelfDiscard(next, tile, false))
+            {
+                continue;
+            }
+
+            const StaticHandEvaluation candidateEvaluation = AnalyzeStaticHand(next);
+            int candidateScore = candidateEvaluation.score;
+            candidateScore += EvaluateDiscardUrgency(state, tile);
+            candidateScore -= AdjustRiskByAttackState(state, EvaluateDiscardRisk(state, tile));
+            const PlanMetrics& candidatePlan = candidateEvaluation.plan;
+            if (candidateScore > summary.score ||
+                (candidateScore == summary.score &&
+                 (IsBetterExactHandInfo(candidateEvaluation.exact, summary.exact) ||
+                  IsBetterPlanMetrics(candidatePlan, summary.standbyPlan))))
+            {
+                summary.score = candidateScore;
+                summary.standbyPlan = candidatePlan;
+                summary.exact = candidateEvaluation.exact;
+            }
+        }
+
+        if (summary.score == -INF)
+        {
+            summary.score = EvaluateStaticHandShape(state);
+        }
+        return summary;
+    }
+
+    int EvaluateDrawnState(const GameState& state)
+    {
+        return EvaluateDrawnDecision(state).score;
+    }
+
+    int EvaluateFutureDrawPotential(const GameState& state)
+    {
+        if (state.myID < 0 || !IsStandbyState(state))
+        {
+            return 0;
+        }
+
+        const ExactHandInfo exact = AnalyzeExactHandInfo(state);
+        if (exact.shanten == 0)
+        {
+            return 18 * exact.winTiles + 60 * exact.winKinds;
+        }
+        if (exact.shanten == 1)
+        {
+            return 8 * exact.improveTiles +
+                   22 * exact.improveKinds +
+                   10 * exact.futureWinTiles +
+                   24 * exact.futureWinKinds;
+        }
+        return 4 * exact.improveTiles + 12 * exact.improveKinds;
+    }
+
+    int EvaluateForcedDrawState(const GameState& state)
+    {
+        if (state.myID < 0)
+        {
+            return -INF;
+        }
+
+        long long weightedScore = 0;
+        int totalRemain = 0;
+        int bestFuture = -INF;
+
+        for (int tile = 0; tile < TILE_KIND_COUNT; ++tile)
+        {
+            const int remain = state.poolRemain[tile];
+            if (remain <= 0)
+            {
+                continue;
+            }
+
+            GameState next = state;
+            if (!ConsumePoolVisibility(next, tile, 1))
+            {
+                continue;
+            }
+            if (!AddLiveTile(next.players[next.myID], tile))
+            {
+                continue;
+            }
+
+            const int futureScore = EvaluateDrawnState(next);
+            weightedScore += 1LL * remain * futureScore;
+            totalRemain += remain;
+            bestFuture = max(bestFuture, futureScore);
+        }
+
+        if (totalRemain == 0)
+        {
+            return EvaluateStaticHandShape(state) + 40;
+        }
+
+        const int expectedScore = static_cast<int>(weightedScore / totalRemain);
+        return expectedScore + (bestFuture - expectedScore) / 8;
+    }
+
+    struct ScoredAction
+    {
+        Action action;
+        int score = -INF;
+        int cheapScore = -INF;
+        int urgency = 0;
+        int risk = 0;
+        bool usedDeepScore = false;
+        ExactHandInfo exact{};
+    };
+
+    bool ShouldPreferExactOrdering(const ScoredAction& evaluation)
+    {
+        return evaluation.action.type == ActionType::Play || evaluation.action.type == ActionType::Peng;
+    }
+
+    bool IsBetterScoredAction(const ScoredAction& lhs, const ScoredAction& rhs)
+    {
+        if (lhs.action.type == ActionType::Hu)
+        {
+            return rhs.action.type != ActionType::Hu;
+        }
+        if (rhs.action.type == ActionType::Hu)
+        {
+            return false;
+        }
+
+        if (ShouldPreferExactOrdering(lhs) && ShouldPreferExactOrdering(rhs) &&
+            lhs.exact.shanten < INF / 2 && rhs.exact.shanten < INF / 2)
+        {
+            if (IsBetterExactHandInfo(lhs.exact, rhs.exact))
+            {
+                return true;
+            }
+            if (IsBetterExactHandInfo(rhs.exact, lhs.exact))
+            {
+                return false;
+            }
+        }
+
+        if (lhs.score != rhs.score)
+        {
+            return lhs.score > rhs.score;
+        }
+
+        if (lhs.exact.shanten < INF / 2 && rhs.exact.shanten < INF / 2)
+        {
+            if (IsBetterExactHandInfo(lhs.exact, rhs.exact))
+            {
+                return true;
+            }
+            if (IsBetterExactHandInfo(rhs.exact, lhs.exact))
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    vector<ScoredAction> EvaluateDecisionCandidates(const GameState& state, const vector<Action>& legalActions)
+    {
+        vector<ScoredAction> evaluations(legalActions.size());
+        int passScore = -INF;
+        int bestCheapPlay = -INF;
+        int bestCheapPeng = -INF;
+
+        for (size_t i = 0; i < legalActions.size(); ++i)
+        {
+            evaluations[i].action = legalActions[i];
+            const Action& action = legalActions[i];
+
+            if (action.type == ActionType::Hu)
+            {
+                evaluations[i].score = 1000000;
+                evaluations[i].cheapScore = 1000000;
+                evaluations[i].usedDeepScore = true;
+                evaluations[i].exact.shanten = -1;
+                continue;
+            }
+
+            if (action.type == ActionType::Pass)
+            {
+                passScore = EvaluateHandShape(state);
+                evaluations[i].score = passScore;
+                evaluations[i].cheapScore = passScore;
+                evaluations[i].usedDeepScore = true;
+                evaluations[i].exact = AnalyzeExactHandInfo(state);
+                continue;
+            }
+
+            if (action.type == ActionType::Play)
+            {
+                GameState next = state;
+                if (!ApplySelfDiscard(next, action.tile, false))
+                {
+                    continue;
+                }
+                const StaticHandEvaluation nextEval = AnalyzeStaticHand(next);
+                evaluations[i].exact = nextEval.exact;
+                evaluations[i].urgency = EvaluateDiscardUrgency(state, action.tile);
+                evaluations[i].risk = AdjustRiskByAttackState(state, EvaluateDiscardRisk(state, action.tile));
+                evaluations[i].cheapScore = nextEval.score + evaluations[i].urgency - evaluations[i].risk;
+                bestCheapPlay = max(bestCheapPlay, evaluations[i].cheapScore);
+                continue;
+            }
+
+            if (action.type == ActionType::Peng || action.type == ActionType::Gang)
+            {
+                GameState next;
+                if (!SimulateAction(state, action, next))
+                {
+                    continue;
+                }
+                const StaticHandEvaluation nextEval = AnalyzeStaticHand(next);
+                evaluations[i].exact = nextEval.exact;
+                if (action.type == ActionType::Peng)
+                {
+                    evaluations[i].risk = AdjustRiskByAttackState(state, EvaluateDiscardRisk(state, action.discardTile));
+                    evaluations[i].cheapScore = nextEval.score - 24 - evaluations[i].risk;
+                    bestCheapPeng = max(bestCheapPeng, evaluations[i].cheapScore);
+                }
+                continue;
+            }
+        }
+
+        for (size_t i = 0; i < legalActions.size(); ++i)
+        {
+            const Action& action = legalActions[i];
+            if (action.type == ActionType::Hu || action.type == ActionType::Pass)
+            {
+                continue;
+            }
+
+            if (action.type == ActionType::Play)
+            {
+                evaluations[i].score = evaluations[i].cheapScore;
+                if (bestCheapPlay - evaluations[i].cheapScore <= 90)
+                {
+                    evaluations[i].score = EvaluateDiscard(state, action.tile);
+                    evaluations[i].usedDeepScore = true;
+                }
+                continue;
+            }
+
+            GameState next;
+            if (!SimulateAction(state, action, next))
+            {
+                continue;
+            }
+
+            if (action.type == ActionType::Gang)
+            {
+                evaluations[i].score = EvaluateForcedDrawState(next);
+                evaluations[i].usedDeepScore = true;
+            }
+            else if (action.type == ActionType::Peng)
+            {
+                evaluations[i].score = evaluations[i].cheapScore;
+                if (bestCheapPeng - evaluations[i].cheapScore <= 90)
+                {
+                    evaluations[i].score = EvaluateHandShape(next) - 24 - evaluations[i].risk;
+                    if (passScore > -INF / 2 && evaluations[i].score <= passScore + 12)
+                    {
+                        evaluations[i].score -= 20;
+                    }
+                    evaluations[i].usedDeepScore = true;
+                }
+                else if (passScore > -INF / 2 && evaluations[i].score <= passScore + 12)
+                {
+                    evaluations[i].score -= 20;
+                }
+            }
+        }
+
+        return evaluations;
+    }
+
+    Action PickBestScoredAction(const vector<ScoredAction>& evaluations)
+    {
+        ScoredAction best;
+        bool hasBest = false;
+        for (const ScoredAction& evaluation : evaluations)
+        {
+            if (!hasBest || IsBetterScoredAction(evaluation, best))
+            {
+                best = evaluation;
+                hasBest = true;
+            }
+        }
+        return best.action;
+    }
+
+    string BuildExactInfoString(const ExactHandInfo& exact)
+    {
+        if (exact.shanten <= -1)
+        {
+            return "hu";
+        }
+        if (exact.shanten >= INF / 2)
+        {
+            return "na";
+        }
+
+        string out = "s=" + to_string(exact.shanten) +
+                     ",imp=" + to_string(exact.improveTiles) + "/" + to_string(exact.improveKinds) +
+                     ",win=" + to_string(exact.winTiles) + "/" + to_string(exact.winKinds);
+        if (exact.shanten == 1)
+        {
+            out += ",fw=" + to_string(exact.futureWinTiles) + "/" + to_string(exact.futureWinKinds);
+        }
+        return out;
+    }
+
+    string BuildDecisionDiagnostics(
+        const ParsedRequest& currentReq,
+        const vector<ScoredAction>& evaluations,
+        const Action& chosen)
+    {
+        vector<ScoredAction> ranked = evaluations;
+        stable_sort(
+            ranked.begin(),
+            ranked.end(),
+            [](const ScoredAction& lhs, const ScoredAction& rhs)
+            {
+                return IsBetterScoredAction(lhs, rhs);
+            });
+
+        string out = "req=" + currentReq.raw + ";choose=" + FormatAction(chosen);
+        size_t count = 0;
+        for (const ScoredAction& evaluation : ranked)
+        {
+            if (evaluation.score <= -INF / 2)
+            {
+                continue;
+            }
+            if (count >= kMaxDiagnosticActions)
+            {
+                break;
+            }
+
+            out += ";";
+            out += FormatAction(evaluation.action);
+            out += "{sc=" + to_string(evaluation.score);
+            if (evaluation.cheapScore > -INF / 2 && evaluation.cheapScore != evaluation.score)
+            {
+                out += ",cheap=" + to_string(evaluation.cheapScore);
+            }
+            if (evaluation.urgency != 0)
+            {
+                out += ",urg=" + to_string(evaluation.urgency);
+            }
+            if (evaluation.risk != 0)
+            {
+                out += ",risk=" + to_string(evaluation.risk);
+            }
+            out += ",deep=" + string(evaluation.usedDeepScore ? "1" : "0");
+            out += "," + BuildExactInfoString(evaluation.exact);
+            out += "}";
+            ++count;
+        }
+        return out;
+    }
+}
+
 int EvaluateHandShape(const GameState& state)
 {
-    if (state.myID < 0)
+    const int baseScore = EvaluateStaticHandShape(state);
+    if (baseScore <= -INF / 2 || baseScore >= 1000000)
     {
-        return -INF;
+        return baseScore;
     }
-
-    if (CanHu(state))
-    {
-        return 1000000;
-    }
-
-    const PlayerState& me = state.players[state.myID];
-    const TargetPlan targetPlan = FindBestTargetPlan(state);
-
-    int score = 0;
-    if (targetPlan.valid)
-    {
-        score += 2200;
-        score -= 120 * targetPlan.distance;
-        score += 4 * targetPlan.support;
-    }
-    score += 90 * CountFixedMelds(me);
-    score += CountPairTripletBonus(me.liveCount);
-    score += CountAdjacencyBonus(me.liveCount);
-    score += 2 * TotalLiveCount(me);
-    return score;
+    return baseScore + EvaluateFutureDrawPotential(state);
 }
 
 int EvaluateDiscard(const GameState& state, int tileId)
@@ -1905,66 +3329,14 @@ int EvaluateDiscard(const GameState& state, int tileId)
         return -INF;
     }
 
-    int score = EvaluateHandShape(next);
-    score += 3 * (4 - max(0, state.poolRemain[tileId]));
-    if (state.players[state.myID].liveCount[tileId] == 1)
-    {
-        score += 5;
-    }
-    return score;
+    return EvaluateHandShape(next) +
+           EvaluateDiscardUrgency(state, tileId) -
+           AdjustRiskByAttackState(state, EvaluateDiscardRisk(state, tileId));
 }
 
 Action ChooseBestAction(const GameState& state, const vector<Action>& legalActions)
 {
-    Action bestAction;
-    int bestScore = -INF;
-
-    for (const Action& action : legalActions)
-    {
-        if (action.type == ActionType::Hu)
-        {
-            return action;
-        }
-
-        int score = -INF;
-        if (action.type == ActionType::Play)
-        {
-            score = EvaluateDiscard(state, action.tile);
-        }
-        else if (action.type == ActionType::Pass)
-        {
-            score = EvaluateHandShape(state);
-        }
-        else if (action.type == ActionType::Peng || action.type == ActionType::Gang)
-        {
-            GameState next;
-            if (!SimulateAction(state, action, next))
-            {
-                continue;
-            }
-            score = EvaluateHandShape(next);
-            if (action.type == ActionType::Gang)
-            {
-                score += action.onDiscard ? 18 : 28;
-            }
-            if (action.type == ActionType::Peng)
-            {
-                score -= 6;
-            }
-        }
-        else
-        {
-            score = EvaluateHandShape(state);
-        }
-
-        if (score > bestScore)
-        {
-            bestScore = score;
-            bestAction = action;
-        }
-    }
-
-    return bestAction;
+    return PickBestScoredAction(EvaluateDecisionCandidates(state, legalActions));
 }
 
 string BuildBestTargetHand(const GameState& state)
@@ -1982,7 +3354,7 @@ string BuildBestTargetHand(const GameState& state)
     return "W1 W1 W1 T1 T1 T1 B1 B1 B1 B2 B2 B2 T9 T9";
 }
 
-Action DecideAction(const GameState& state, const ParsedRequest& currentReq)
+Action DecideAction(const GameState& state, const ParsedRequest& currentReq, string* diagnostics)
 {
     GameState decisionState = state;
     if (!ApplyRequestEvent(decisionState, currentReq))
@@ -2007,14 +3379,13 @@ Action DecideAction(const GameState& state, const ParsedRequest& currentReq)
     }
 
     const vector<Action> legalActions = GenerateLegalActions(decisionState, currentReq);
-    for (const Action& action : legalActions)
+    const vector<ScoredAction> evaluations = EvaluateDecisionCandidates(decisionState, legalActions);
+    const Action bestAction = PickBestScoredAction(evaluations);
+    if (diagnostics != nullptr)
     {
-        if (action.type == ActionType::Hu)
-        {
-            return action;
-        }
+        *diagnostics = BuildDecisionDiagnostics(currentReq, evaluations, bestAction);
     }
-    return ChooseBestAction(decisionState, legalActions);
+    return bestAction;
 }
 
 string FormatAction(const Action& action)
@@ -2077,9 +3448,11 @@ int main()
     }
 
     const ParsedRequest currentReq = ParseRequestLine(state.requests[state.turnID]);
-    const Action action = DecideAction(state, currentReq);
+    string diagnostics;
+    const Action action = DecideAction(state, currentReq, kEmitDecisionDiagnostics ? &diagnostics : nullptr);
     const string response = FormatAction(action);
 
-    cout << "{\"response\":\"" << EscapeJsonString(response) << "\",\"data\":\"\"}\n";
+    cout << "{\"response\":\"" << EscapeJsonString(response) << "\",\"data\":\""
+         << EscapeJsonString(kEmitDecisionDiagnostics ? diagnostics : string()) << "\"}\n";
     return 0;
 }
